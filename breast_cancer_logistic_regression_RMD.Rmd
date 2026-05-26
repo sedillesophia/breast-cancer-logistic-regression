@@ -2,7 +2,6 @@
 title: "Logistische Regression zur Brustkrebs-Diagnose mit Feature Selection"
 author: "Data Analysis"
 date: "`r Sys.Date()`"
-
 ---
 
 ```{r setup, include=FALSE}
