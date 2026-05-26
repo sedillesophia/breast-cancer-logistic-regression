@@ -1,0 +1,743 @@
+---
+title: "Logistische Regression zur Brustkrebs-Diagnose mit Feature Selection"
+author: "Data Analysis"
+date: "`r Sys.Date()`"
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.width = 10, fig.height = 6, dpi = 300)
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Check and install missing packages
+required_packages <- c(
+  "readxl", "dplyr", "tidyr", "stringr",
+  "ggplot2", "broom", "car",
+  "glmnet", "pROC", "forcats", "corrplot", "stargazer"
+)
+
+# Function to check and install packages
+install_if_missing <- function(pkg) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    cat("Versuche Paket zu installieren:", pkg, "\n")
+    install.packages(pkg, repos = "http://cran.rstudio.com/", dependencies = TRUE)
+    if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+      stop("Fehler: Paket '", pkg, "' konnte nicht geladen werden.\n",
+           "Bitte installieren Sie es manuell in R:\n",
+           "  install.packages('", pkg, "', dependencies = TRUE)\n",
+           "Falls das Problem mit 'car' auftritt, versuchen Sie:\n",
+           "  install.packages(c('nloptr', 'carData', 'pbkrtest', 'lme4', 'car'), dependencies = TRUE)")
+    }
+  }
+}
+
+# Install and load packages one by one
+cat("Prüfe und installiere Pakete bei Bedarf...\n")
+for(pkg in required_packages) {
+  install_if_missing(pkg)
+}
+cat("Alle Pakete erfolgreich geladen.\n")
+```
+
+# 1. Setup
+
+Dieses Dokument führt eine logistische Regression zur Vorhersage der Brustkrebs-Diagnose durch. Der Fokus liegt auf einer robusten Feature Selection unter Vermeidung von Multikollinearität.
+
+**Zielvariable:** diagnosis (M = Malignant = 1, B = Benign = 0)
+
+**Methodik:**
+- Korrelationsfilter (|r| > 0.9)
+- VIF-Check (VIF < 5)
+- LASSO-Regularisierung für Feature Selection
+- Finales GLM-Modell auf selektierten Features
+
+```{r load-data, echo=TRUE}
+# Read Excel file
+data_raw <- read_excel("dataset_stat.xlsx", skip = 1)
+
+# Check structure
+cat("Original dataset dimensions:", dim(data_raw), "\n")
+cat("Column names (first 10):", paste(head(colnames(data_raw), 10), collapse = ", "), "\n")
+
+# Remove header row if it contains variable names
+if(nrow(data_raw) > 0 && !is.na(data_raw[1, 1]) && data_raw[1, 1] == "id") {
+  data_raw <- data_raw[-1, ]
+}
+
+cat("After cleaning, dimensions:", dim(data_raw), "\n")
+path <- paste(getwd(), "/dataset_stat.xlsx", sep="")
+cat(path)
+file.exists(path)
+View(data_raw)
+
+```
+
+# 2. Data Load & Cleaning
+
+```{r preprocessing, echo=TRUE}
+# Identify ID column (common names: id, ID, X, or first column if it looks like ID)
+id_cols <- which(tolower(colnames(data_raw)) %in% c("id", "x") | 
+                 grepl("^id", tolower(colnames(data_raw)), ignore.case = TRUE))
+if(length(id_cols) > 0) {
+  id_col_name <- colnames(data_raw)[id_cols[1]]
+  cat("ID column identified:", id_col_name, "\n")
+  data <- data_raw %>% select(-all_of(id_col_name))
+} else {
+  # Check if first column looks like ID (all unique values)
+  if(length(unique(data_raw[[1]])) == nrow(data_raw)) {
+    cat("First column appears to be ID (all unique), removing it\n")
+    data <- data_raw %>% select(-1)
+  } else {
+    data <- data_raw
+    cat("No ID column identified, keeping all columns\n")
+  }
+}
+
+# Convert diagnosis to binary: M = 1, B = 0
+data$diagnosis <- as.character(data$diagnosis)
+data$diagnosis_binary <- ifelse(data$diagnosis == "M", 1, 0)
+
+cat("\nDiagnosis distribution:\n")
+print(table(data$diagnosis, useNA = "ifany"))
+cat("\nBinary diagnosis distribution:\n")
+print(table(data$diagnosis_binary, useNA = "ifany"))
+
+# Separate predictors and outcome
+predictors_data <- data %>% 
+  select(-diagnosis, -diagnosis_binary)
+
+# Convert all columns to numeric (they should be numeric but might be character)
+predictors_data <- predictors_data %>%
+  mutate_all(~as.numeric(as.character(.))) %>%
+  select_if(~!all(is.na(.)))  # Remove columns that are all NA
+
+# Check for missing values
+missing_counts <- colSums(is.na(predictors_data))
+if(sum(missing_counts) > 0) {
+  cat("\nMissing values found:\n")
+  print(missing_counts[missing_counts > 0])
+  # Remove rows with missing values
+  complete_rows <- complete.cases(predictors_data)
+  predictors_data <- predictors_data[complete_rows, ]
+  data <- data[complete_rows, ]
+  cat("\nRemoved", sum(!complete_rows), "rows with missing values\n")
+} else {
+  cat("\nNo missing values found in predictors\n")
+}
+
+# Final dataset
+y <- data$diagnosis_binary
+X <- predictors_data
+
+cat("\nFinal dataset dimensions:", dim(X), "\n")
+cat("Number of predictors:", ncol(X), "\n")
+cat("Number of observations:", nrow(X), "\n")
+```
+
+# 3. Explorative Checks
+
+```{r exploratory, echo=TRUE}
+# Class balance
+cat("Class balance:\n")
+class_table <- table(y)
+print(class_table)
+cat("Proportions:\n")
+print(prop.table(class_table))
+
+# Summary statistics of predictors
+if(ncol(X) > 0) {
+  cat("\nSummary of predictors (first 5):\n")
+  print(summary(X[, 1:min(5, ncol(X))]))
+} else {
+  cat("\nWarnung: Keine Prädiktoren verfügbar!\n")
+}
+```
+
+```{r class-distribution-plot, echo=TRUE, fig.width=8, fig.height=6}
+# Barplot: Verteilung der Zielvariable (Klassen M und B)
+diagnosis_dist <- data.frame(
+  Diagnosis = c("Benign (B)", "Malignant (M)"),
+  Count = c(sum(data$diagnosis == "B"), sum(data$diagnosis == "M"))
+)
+
+class_distribution_plot <- ggplot(diagnosis_dist, aes(x = Diagnosis, y = Count, fill = Diagnosis)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  scale_fill_manual(values = c("Benign (B)" = "#2E8B57", "Malignant (M)" = "#CD5C5C"),
+                    guide = "none") +
+  geom_text(aes(label = Count), vjust = -0.3, size = 5, fontface = "bold") +
+  labs(
+    title = "Distribution of Diagnosis Classes",
+    subtitle = "Number of Benign (B) vs. Malignant (M) Cases",
+    x = "Diagnosis",
+    y = "Count"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.title = element_text(size = 12),
+    axis.text = element_text(size = 11),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  ylim(0, max(diagnosis_dist$Count) * 1.1)
+
+print(class_distribution_plot)
+
+# Save plot
+ggsave("class_distribution.png", class_distribution_plot, width = 8, height = 6, dpi = 300)
+cat("\nClass distribution plot saved as: class_distribution.png\n")
+```
+
+# 4. Multicollinearity Handling
+
+## 4.1 Korrelationsfilter
+
+```{r correlation-filter, echo=TRUE}
+# Calculate correlation matrix
+cor_matrix <- cor(X, use = "complete.obs")
+
+# Find highly correlated pairs (|r| > 0.9)
+high_cor <- which(abs(cor_matrix) > 0.9 & cor_matrix != 1, arr.ind = TRUE)
+
+if(nrow(high_cor) > 0) {
+  # Create a list of variables to remove (keep one from each pair)
+  vars_to_remove <- c()
+  for(i in 1:nrow(high_cor)) {
+    var1 <- rownames(cor_matrix)[high_cor[i, 1]]
+    var2 <- colnames(cor_matrix)[high_cor[i, 2]]
+    if(!var1 %in% vars_to_remove && !var2 %in% vars_to_remove) {
+      # Remove the second one (arbitrary choice)
+      vars_to_remove <- c(vars_to_remove, var2)
+    }
+  }
+  
+  cat("Highly correlated variables (|r| > 0.9) found. Removing:", length(vars_to_remove), "variables\n")
+  print(vars_to_remove)
+  
+  X <- X %>% select(-all_of(vars_to_remove))
+  cat("\nAfter correlation filter, remaining predictors:", ncol(X), "\n")
+} else {
+  cat("No highly correlated pairs (|r| > 0.9) found\n")
+}
+
+# Correlation heatmap (if not too many variables)
+if(ncol(X) <= 30) {
+  # Erstelle Korrelationsmatrix-Plot
+  cor_matrix_plot <- cor(X, use = "complete.obs")
+  
+  # Plot in Konsole anzeigen
+  corrplot(cor_matrix_plot, type = "upper", 
+           order = "hclust", tl.cex = 0.7, tl.col = "black")
+  
+  # Speichere Korrelationsmatrix als PNG
+  png("correlation_matrix.png", width = 12, height = 10, units = "in", res = 300)
+  corrplot(cor_matrix_plot, type = "upper", 
+           order = "hclust", tl.cex = 0.7, tl.col = "black",
+           title = "Correlation Matrix", mar = c(0, 0, 2, 0))
+  dev.off()
+  
+  cat("\nKorrelationsmatrix wurde gespeichert als: correlation_matrix.png\n")
+} else {
+  cat("\nZu viele Variablen (", ncol(X), ") für Korrelationsmatrix-Plot. Überspringe Visualisierung.\n")
+}
+```
+
+## 4.2 VIF-Check und iterative Bereinigung
+
+```{r vif-check, echo=TRUE}
+# Create initial model for VIF calculation
+# We need to fit a GLM first to calculate VIF
+initial_model <- glm(y ~ ., data = data.frame(y = y, X), family = binomial)
+
+# Calculate VIF
+vif_values <- vif(initial_model)
+
+cat("Initial VIF values:\n")
+print(sort(vif_values, decreasing = TRUE))
+
+# Iteratively remove variables with VIF >= 5
+vif_threshold <- 5
+X_vif_cleaned <- X
+max_iterations <- 50
+iteration <- 0
+
+while(iteration < max_iterations) {
+  # Fit model
+  temp_model <- glm(y ~ ., data = data.frame(y = y, X_vif_cleaned), 
+                    family = binomial, maxit = 100)
+  
+  # Check VIF
+  vif_current <- tryCatch(vif(temp_model), error = function(e) NULL)
+  
+  if(is.null(vif_current)) {
+    cat("VIF calculation failed, breaking loop\n")
+    break
+  }
+  
+  max_vif <- max(vif_current)
+  
+  if(max_vif < vif_threshold) {
+    cat("\nAll VIF values <", vif_threshold, "after", iteration, "iterations\n")
+    break
+  }
+  
+  # Remove variable with highest VIF
+  var_to_remove <- names(which.max(vif_current))
+  
+  # Check if variable exists in data frame
+  if(!var_to_remove %in% colnames(X_vif_cleaned)) {
+    cat("Warning: Variable", var_to_remove, "not found in data, breaking loop\n")
+    break
+  }
+  
+  cat("Iteration", iteration + 1, ": Removing", var_to_remove, 
+      "(VIF =", round(max_vif, 2), ")\n")
+  
+  X_vif_cleaned <- X_vif_cleaned %>% select(-all_of(var_to_remove))
+  iteration <- iteration + 1
+}
+
+# Final VIF check
+final_model_vif <- glm(y ~ ., data = data.frame(y = y, X_vif_cleaned), 
+                       family = binomial, maxit = 100)
+vif_final <- vif(final_model_vif)
+
+cat("\nFinal VIF values (all <", vif_threshold, "):\n")
+print(sort(vif_final, decreasing = TRUE))
+
+cat("\nVariables remaining after VIF filtering:", ncol(X_vif_cleaned), "\n")
+
+# Create VIF comparison table
+vif_comparison <- data.frame(
+  Variable = names(vif_final),
+  VIF_Final = round(vif_final, 3)
+) %>%
+  arrange(desc(VIF_Final))
+
+print(vif_comparison)
+```
+
+# 5. Feature Selection mit LASSO
+
+```{r lasso-selection, echo=TRUE}
+# Prepare data for glmnet (requires matrix)
+X_matrix <- as.matrix(X_vif_cleaned)
+
+# Standardize predictors for LASSO
+X_scaled <- scale(X_matrix)
+X_scaled[is.nan(X_scaled)] <- 0  # Handle any NaN from scaling
+
+# Cross-validated LASSO
+cv_lasso <- cv.glmnet(X_scaled, y, family = "binomial", alpha = 1, 
+                      nfolds = 10, type.measure = "auc")
+
+# Plot cross-validation results
+plot(cv_lasso)
+
+# Get lambda.min and lambda.1se
+lambda_min <- cv_lasso$lambda.min
+lambda_1se <- cv_lasso$lambda.1se
+
+cat("Lambda min:", lambda_min, "\n")
+cat("Lambda 1se:", lambda_1se, "\n")
+
+# Use lambda.min for more features, lambda.1se for more parsimony
+lambda_selected <- lambda_min
+cat("\nUsing lambda.min for feature selection\n")
+
+# Get coefficients at selected lambda
+lasso_coef <- coef(cv_lasso, s = lambda_selected)
+lasso_features <- rownames(lasso_coef)[which(lasso_coef != 0)][-1]  # Exclude intercept
+
+cat("\nSelected features by LASSO (", length(lasso_features), "features):\n")
+print(lasso_features)
+
+# Selected features dataframe
+selected_features_df <- data.frame(
+  Feature = lasso_features,
+  Method = "LASSO"
+)
+
+# Save selected features
+write.csv(selected_features_df, "selected_features.csv", row.names = FALSE)
+```
+
+# 6. Finale Logistische Regression
+
+```{r final-glm, echo=TRUE}
+# Refit GLM on selected features (non-scaled data for interpretable coefficients)
+X_final <- X_vif_cleaned %>% select(all_of(lasso_features))
+
+# Fit final model
+final_model <- glm(y ~ ., data = data.frame(y = y, X_final), 
+                   family = binomial(link = "logit"))
+
+# Model summary
+cat("Final Model Summary:\n")
+print(summary(final_model))
+
+# Extract coefficients #Finale Koeffizienten-Summary 
+coef_summary <- broom::tidy(final_model, conf.int = TRUE, exponentiate = FALSE)
+
+# Calculate Odds Ratios and CI, Erweiterung um Odds Ratios
+coef_summary$odds_ratio <- exp(coef_summary$estimate)
+coef_summary$odds_ratio_ci_lower <- exp(coef_summary$conf.low)
+coef_summary$odds_ratio_ci_upper <- exp(coef_summary$conf.high)
+
+# Sort by p-value (most significant first)
+coef_summary <- coef_summary %>% 
+  arrange(p.value) %>%
+  mutate(
+    p_value_formatted = ifelse(p.value < 0.001, "< 0.001", 
+                               sprintf("%.4f", p.value)),
+    significant = ifelse(p.value < 0.05, "Yes", "No")
+  )
+
+cat("\nFinal Coefficients (sorted by p-value):\n")
+#finale summary
+print(coef_summary %>% 
+      select(term, estimate, std.error, statistic, p.value, odds_ratio,
+             odds_ratio_ci_lower, odds_ratio_ci_upper, significant))
+
+# Save coefficients table
+write.csv(coef_summary, "final_glm_coefficients.csv", row.names = FALSE)
+
+# Reskalierung für bessere Interpretierbarkeit der Odds Ratios
+# HINWEIS: Dies ist KEINE Standardisierung, sondern ein Rescaling nur aus Gründen 
+# der besseren Lesbarkeit der Odds Ratios. Variablen mit sehr kleiner Skalierung 
+# werden multipliziert, damit die Odds Ratios interpretierbar werden, ohne die 
+# statistischen Eigenschaften des Modells zu ändern.
+
+# Identifiziere alle Variablen mit sehr kleiner Skalierung
+# 1. Alle _se-Variablen (smoothness_se, concavity_se, compactness_se, symmetry_se)
+vars_se <- grep("_se$", colnames(X_final), value = TRUE)
+
+# 2. Spezifische _worst-Variablen mit sehr kleiner Skala
+# (smoothness_worst, concave.points_worst, symmetry_worst)
+vars_worst_small <- c("smoothness_worst", "concave.points_worst", "concave points_worst", "symmetry_worst")
+vars_worst_small <- vars_worst_small[vars_worst_small %in% colnames(X_final)]
+
+# Kombiniere alle zu reskalierenden Variablen
+vars_to_rescale <- unique(c(vars_se, vars_worst_small))
+
+if(length(vars_to_rescale) > 0) {
+  cat("\nReskaliere Variablen mit kleiner Skalierung (x1000):\n")
+  cat("_se-Variablen:", paste(vars_se, collapse = ", "), "\n")
+  if(length(vars_worst_small) > 0) {
+    cat("_worst-Variablen:", paste(vars_worst_small, collapse = ", "), "\n")
+  }
+  cat("Gesamt:", length(vars_to_rescale), "Variablen\n")
+  
+  # Erstelle reskalierte Version von X_final
+  X_final_rescaled <- X_final
+  
+  # Reskaliere identifizierte Variablen (Multiplikation mit 1000)
+  for(var in vars_to_rescale) {
+    X_final_rescaled[[var]] <- X_final_rescaled[[var]] * 1000
+  }
+  
+  # Fitte Modell mit vollständig reskalierten Variablen
+  final_model_rescaled <- glm(y ~ ., data = data.frame(y = y, X_final_rescaled), 
+                              family = binomial(link = "logit"))
+  
+  # Berechne Odds Ratios des reskalierten Modells
+  odds_ratios_rescaled <- exp(coef(final_model_rescaled))
+  
+  # Erstelle HTML-Tabelle mit stargazer (Odds Ratios anstelle von Logit-Koeffizienten)
+  # Fußnote: Explizit erwähnen, welche Variablen reskaliert wurden
+  rescale_note <- paste0(
+    "Odds Ratios (exponentiated coefficients) are shown. ",
+    "Selected variables with very small measurement scales were rescaled (x1000) for better interpretability: ",
+    "all variables ending with '_se' (smoothness_se, concavity_se, compactness_se, symmetry_se) ",
+    "and specific _worst variables (smoothness_worst, concave.points_worst, symmetry_worst). ",
+    "Standard errors and p-values refer to the original logit coefficients. ",
+    "This rescaling is for presentation purposes only and does not constitute standardization."
+  )
+  
+  stargazer(final_model_rescaled, 
+            type = "html",
+            out = "final_glm_odds_ratios.htm",
+            coef = list(odds_ratios_rescaled),
+            p.auto = FALSE,
+            title = "Final Logistic Regression Model: Odds Ratios",
+            notes = rescale_note,
+            notes.append = FALSE)
+  
+  cat("\nOdds Ratios Tabelle (mit vollständig reskalierten Variablen) wurde gespeichert als: final_glm_odds_ratios.htm\n")
+} else {
+  # Falls keine Variablen zum Reskalieren vorhanden, verwende ursprüngliches Modell
+  cat("\nKeine Variablen mit kleiner Skalierung zum Reskalieren gefunden. Verwende ursprüngliches Modell.\n")
+  odds_ratios <- exp(coef(final_model))
+  
+  # Setze final_model_rescaled und X_final_rescaled auf ursprüngliche Werte
+  # damit sie für Forest Plot und Boxplots verfügbar sind
+  final_model_rescaled <- final_model
+  X_final_rescaled <- X_final
+  
+  stargazer(final_model, 
+            type = "html",
+            out = "final_glm_odds_ratios.htm",
+            coef = list(odds_ratios),
+            p.auto = FALSE,
+            title = "Final Logistic Regression Model: Odds Ratios",
+            notes = "Odds Ratios (exponentiated coefficients) are shown. Standard errors and p-values refer to the original logit coefficients.",
+            notes.append = FALSE)
+  
+  cat("\nOdds Ratios Tabelle wurde gespeichert als: final_glm_odds_ratios.htm\n")
+}
+
+# Model fit statistics
+cat("\nModel Fit Statistics:\n")
+cat("AIC:", AIC(final_model), "\n")
+cat("Null Deviance:", final_model$null.deviance, "\n")
+cat("Residual Deviance:", final_model$deviance, "\n")
+pseudo_r2 <- 1 - (final_model$deviance / final_model$null.deviance)
+cat("Pseudo R-squared (McFadden):", round(pseudo_r2, 4), "\n")
+```
+
+**Hinweis:** "Höchster p-Wert" bedeutet üblicherweise die am wenigsten signifikanten Variablen. In diesem Report werden Features nach **niedrigstem p-Wert** sortiert, d.h. die signifikantesten Features erscheinen zuerst.
+
+# 7. Visualisierungen
+
+## 7.1 Forest Plot: Odds Ratios (Top 10 Features)
+
+```{r forest-plot, echo=TRUE, fig.width=10, fig.height=7}
+# Forest Plot basiert auf dem reskalierten Modell
+# HINWEIS: Dieser Forest Plot verwendet das reskalierte Modell (final_model_rescaled),
+# damit alle Odds Ratios sich auf sinnvolle, vergleichbare Einheitenänderungen beziehen.
+# Reskalierte Prädiktoren (z.B. _se- und _worst-Variablen x1000) ermöglichen eine
+# realistische Darstellung der Effekte pro Einheitserhöhung.
+
+# Berechne coef_summary aus dem reskalierten Modell
+coef_summary_rescaled <- broom::tidy(final_model_rescaled, conf.int = TRUE, exponentiate = FALSE)
+
+# Berechne Odds Ratios und 95%-Konfidenzintervalle explizit aus dem reskalierten Modell
+coef_summary_rescaled$odds_ratio <- exp(coef_summary_rescaled$estimate)
+coef_summary_rescaled$odds_ratio_ci_lower <- exp(coef_summary_rescaled$conf.low)
+coef_summary_rescaled$odds_ratio_ci_upper <- exp(coef_summary_rescaled$conf.high)
+
+# Sortiere nach p-Wert und markiere Signifikanz
+coef_summary_rescaled <- coef_summary_rescaled %>%
+  arrange(p.value) %>%
+  mutate(
+    significant = ifelse(p.value < 0.05, "Yes", "No")
+  )
+
+# Select top 10 features (excluding intercept) aus dem reskalierten Modell
+top10 <- coef_summary_rescaled %>%
+  filter(term != "(Intercept)") %>%
+  slice_head(n = 10) %>%
+  mutate(term = fct_reorder(term, -p.value))  # Order by significance
+
+# Create forest plot
+forest_plot <- ggplot(top10, aes(x = odds_ratio, y = term)) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "gray50") +
+  geom_point(aes(color = significant), size = 3) +
+  geom_errorbarh(aes(xmin = odds_ratio_ci_lower, xmax = odds_ratio_ci_upper,
+                     color = significant), height = 0.2) +
+  scale_x_log10() +
+  scale_color_manual(values = c("Yes" = "red", "No" = "blue"),
+                     labels = c("Yes" = "Significant (p < 0.05)", 
+                               "No" = "Not significant")) +
+  labs(
+    title = "Forest Plot: Odds Ratios (Top 10 Features)",
+    subtitle = "95% Confidence Intervals on log scale (based on rescaled predictors)",
+    x = "Odds Ratio (log scale)",
+    y = "Feature",
+    color = "Significance"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "bottom"
+  )
+
+print(forest_plot)
+
+# Save plot
+ggsave("top10_or_forest.png", forest_plot, width = 10, height = 7, dpi = 300)
+```
+
+## 7.2 Coefficient Plot: Beta Estimates (Top 10 Features)
+
+```{r coefficient-plot, echo=TRUE, fig.width=10, fig.height=7}
+# Coefficient plot
+coef_plot <- ggplot(top10, aes(x = estimate, y = term)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_bar(aes(fill = estimate > 0), stat = "identity", width = 0.6) +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2, 
+                 color = "black", alpha = 0.7) +
+  scale_fill_manual(values = c("TRUE" = "#2E8B57", "FALSE" = "#CD5C5C"),
+                    labels = c("TRUE" = "Positive", "FALSE" = "Negative"),
+                    guide = guide_legend(title = "Direction")) +
+  labs(
+    title = "Coefficient Plot: Beta Estimates (Top 10 Features)",
+    subtitle = "95% Confidence Intervals shown as error bars",
+    x = "Beta Coefficient (log-odds scale)",
+    y = "Feature",
+    fill = "Direction"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    legend.position = "bottom"
+  )
+
+print(coef_plot)
+
+# Save plot
+ggsave("top10_betas.png", coef_plot, width = 10, height = 7, dpi = 300)
+```
+
+# 8. Model Performance: ROC-AUC
+
+```{r roc-auc, echo=TRUE}
+# Predictions
+predicted_probs <- predict(final_model, type = "response")
+predicted_class <- ifelse(predicted_probs > 0.5, 1, 0)
+
+# Confusion Matrix
+conf_matrix <- table(Actual = y, Predicted = predicted_class)
+cat("Confusion Matrix:\n")
+print(conf_matrix)
+
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+sensitivity <- conf_matrix[2, 2] / sum(conf_matrix[2, ])
+specificity <- conf_matrix[1, 1] / sum(conf_matrix[1, ])
+
+cat("\nPerformance Metrics:\n")
+cat("Accuracy:", round(accuracy, 4), "\n")
+cat("Sensitivity (Recall):", round(sensitivity, 4), "\n")
+cat("Specificity:", round(specificity, 4), "\n")
+
+# ROC Curve
+roc_obj <- roc(y, predicted_probs, quiet = TRUE)
+auc_value <- auc(roc_obj)
+
+cat("\nROC-AUC:", round(as.numeric(auc_value), 4), "\n")
+
+# Plot ROC Curve
+plot(roc_obj, main = "ROC Curve", print.auc = TRUE, 
+     auc.polygon = TRUE, grid = TRUE)
+```
+
+
+
+# 9. Boxplots for Important Predictors (Rescaled Data)
+
+```{r important-predictors-boxplots, echo=TRUE, fig.width=12, fig.height=6}
+# Boxplots for the most important predictors from logistic regression
+# Uses rescaled data (X_final_rescaled) that were also used for the model
+
+# Define important predictors in order of importance
+important_predictors_requested <- c("texture_worst", "concave.points_worst", "compactness_se")
+
+# Check if X_final_rescaled is available, if not, use X_final
+if(!exists("X_final_rescaled")) {
+  X_final_rescaled <- X_final
+  cat("\nNote: X_final_rescaled not available, using X_final\n")
+}
+
+# Find correct variable names (may have dot or space)
+# Check which variables are actually present
+available_predictors <- c()
+for(pred in important_predictors_requested) {
+  if(pred %in% colnames(X_final_rescaled)) {
+    available_predictors <- c(available_predictors, pred)
+  } else if(pred == "concave.points_worst") {
+    # Try variant with space
+    if("concave points_worst" %in% colnames(X_final_rescaled)) {
+      available_predictors <- c(available_predictors, "concave points_worst")
+    }
+  }
+}
+
+# Ensure predictors are in the specified order
+ordered_predictors <- c()
+for(pred in important_predictors_requested) {
+  if(pred %in% available_predictors) {
+    ordered_predictors <- c(ordered_predictors, pred)
+  } else if(pred == "concave.points_worst" && "concave points_worst" %in% available_predictors) {
+    ordered_predictors <- c(ordered_predictors, "concave points_worst")
+  }
+}
+available_predictors <- ordered_predictors
+
+if(length(available_predictors) > 0) {
+  cat("\nCreating boxplots for important predictors:\n")
+  cat(paste(available_predictors, collapse = ", "), "\n")
+  
+  # Create diagnosis labels
+  diagnosis_labels <- ifelse(data$diagnosis == "M", "Malignant", "Benign")
+  
+  # Create data frame with rescaled data
+  plot_data_important <- data.frame(
+    diagnosis = diagnosis_labels,
+    X_final_rescaled[, available_predictors, drop = FALSE]
+  )
+  
+  # Pivot to long format for facet_wrap
+  # Use all columns except diagnosis (robust to variable names)
+  plot_data_important_long <- plot_data_important %>%
+    pivot_longer(cols = -diagnosis, 
+                 names_to = "predictor", 
+                 values_to = "value")
+  
+  # Clean predictor names: convert to character, remove whitespace, standardize naming
+  plot_data_important_long$predictor <- as.character(plot_data_important_long$predictor)
+  plot_data_important_long$predictor <- trimws(plot_data_important_long$predictor)
+  # Replace "concave points_worst" (with space) with "concave.points_worst" (with dot)
+  plot_data_important_long$predictor[plot_data_important_long$predictor == "concave points_worst"] <- "concave.points_worst"
+  
+  # Set factor levels explicitly to ensure correct facet ordering and no NAs
+  ordered_predictors <- c("texture_worst", "concave.points_worst", "compactness_se")
+  plot_data_important_long$predictor <- factor(plot_data_important_long$predictor, 
+                                                levels = ordered_predictors)
+  
+  # Create boxplots with facet_wrap
+  important_boxplots <- ggplot(plot_data_important_long, 
+                                aes(x = diagnosis, y = value, fill = diagnosis)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.3, size = 0.5) +
+    facet_wrap(~ predictor, scales = "free_y", ncol = 3) +
+    scale_fill_manual(values = c("Benign" = "#2E8B57", "Malignant" = "#CD5C5C"),
+                      name = "Diagnosis") +
+    labs(
+      title = "Boxplots: Important Predictors by Diagnosis (Benign vs. Malignant)",
+      subtitle = paste("Predictors:", paste(available_predictors, collapse = ", ")),
+      x = "Diagnosis",
+      y = "Feature value"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5),
+      axis.title = element_text(size = 11),
+      axis.text = element_text(size = 9),
+      strip.text = element_text(size = 9, face = "bold"),
+      legend.position = "bottom",
+      panel.grid.minor = element_blank()
+    )
+  
+  print(important_boxplots)
+  
+  # Save plot
+  ggsave("important_predictors_boxplots.png", important_boxplots, 
+         width = 12, height = 6, dpi = 300)
+  cat("\nBoxplots saved as: important_predictors_boxplots.png\n")
+} else {
+  cat("\nWarning: None of the requested predictors found.\n")
+  cat("Requested predictors:", paste(important_predictors_requested, collapse = ", "), "\n")
+  cat("Available variables in X_final_rescaled (first 10):\n")
+  cat(paste(head(colnames(X_final_rescaled), 10), collapse = ", "), "\n")
+}
+```
+
